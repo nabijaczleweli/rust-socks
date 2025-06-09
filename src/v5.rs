@@ -1,11 +1,11 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, BigEndian};
 use std::cmp;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, SocketAddrV6, TcpStream, Ipv4Addr,
+use std::net::{SocketAddr, ToSocketAddrs, SocketAddrV4, SocketAddrV6, Ipv4Addr,
                Ipv6Addr, UdpSocket};
 use std::ptr;
 
-use {ToTargetAddr, TargetAddr};
+use {TcpOrUnixStream, SocketAddrOrUnixSocketAddr, ToTargetAddr, TargetAddr};
 use writev::WritevExt;
 
 const MAX_ADDR_LEN: usize = 260;
@@ -37,7 +37,7 @@ fn read_addr<R: Read>(socket: &mut R) -> io::Result<TargetAddr> {
     }
 }
 
-fn read_response(socket: &mut TcpStream) -> io::Result<TargetAddr> {
+fn read_response(socket: &mut TcpOrUnixStream) -> io::Result<TargetAddr> {
 
     if socket.read_u8()? != 5 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid response version"));
@@ -117,7 +117,7 @@ impl<'a> Authentication<'a> {
 /// A SOCKS5 client.
 #[derive(Debug)]
 pub struct Socks5Stream {
-    socket: TcpStream,
+    socket: TcpOrUnixStream,
     proxy_addr: TargetAddr,
 }
 
@@ -127,7 +127,7 @@ impl Socks5Stream {
         where T: ToSocketAddrs,
               U: ToTargetAddr
     {
-        Self::connect_raw(1, proxy, target, &Authentication::None)
+        Self::connect_raw(1, TcpOrUnixStream::connect_tsa(proxy)?, target, &Authentication::None)
     }
 
     /// Connects to a target server through a SOCKS5 proxy using given
@@ -137,15 +137,30 @@ impl Socks5Stream {
               U: ToTargetAddr
     {
         let auth = Authentication::Password { username, password };
-        Self::connect_raw(1, proxy, target, &auth)
+        Self::connect_raw(1, TcpOrUnixStream::connect_tsa(proxy)?, target, &auth)
     }
 
-    fn connect_raw<T, U>(command: u8, proxy: T, target: U, auth: &Authentication) -> io::Result<Socks5Stream>
-        where T: ToSocketAddrs,
+    /// Connects to a target server through a SOCKS5 proxy.
+    pub fn connect_either<T, U>(proxy: T, target: U) -> io::Result<Socks5Stream>
+        where T: Into<SocketAddrOrUnixSocketAddr>,
               U: ToTargetAddr
     {
-        let mut socket = TcpStream::connect(proxy)?;
+        Self::connect_raw(1, TcpOrUnixStream::connect(proxy)?, target, &Authentication::None)
+    }
 
+    /// Connects to a target server through a SOCKS5 proxy using given
+    /// username and password.
+    pub fn connect_either_with_password<T, U>(proxy: T, target: U, username: &str, password: &str) -> io::Result<Socks5Stream>
+        where T: Into<SocketAddrOrUnixSocketAddr>,
+              U: ToTargetAddr
+    {
+        let auth = Authentication::Password { username, password };
+        Self::connect_raw(1, TcpOrUnixStream::connect(proxy)?, target, &auth)
+    }
+
+    fn connect_raw<U>(command: u8, mut socket: TcpOrUnixStream, target: U, auth: &Authentication) -> io::Result<Socks5Stream>
+        where U: ToTargetAddr
+    {
         let target = target.to_target_addr()?;
 
         let packet_len = if auth.is_no_auth() { 3 } else { 4 };
@@ -196,7 +211,7 @@ impl Socks5Stream {
         })
     }
 
-    fn password_authentication(socket: &mut TcpStream, username: &str, password: &str) -> io::Result<()> {
+    fn password_authentication(socket: &mut TcpOrUnixStream, username: &str, password: &str) -> io::Result<()> {
         if username.len() < 1 || username.len() > 255 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid username"))
         };
@@ -231,18 +246,18 @@ impl Socks5Stream {
         &self.proxy_addr
     }
 
-    /// Returns a shared reference to the inner `TcpStream`.
-    pub fn get_ref(&self) -> &TcpStream {
+    /// Returns a shared reference to the inner `TcpOrUnixStream`.
+    pub fn get_ref(&self) -> &TcpOrUnixStream {
         &self.socket
     }
 
-    /// Returns a mutable reference to the inner `TcpStream`.
-    pub fn get_mut(&mut self) -> &mut TcpStream {
+    /// Returns a mutable reference to the inner `TcpOrUnixStream`.
+    pub fn get_mut(&mut self) -> &mut TcpOrUnixStream {
         &mut self.socket
     }
 
-    /// Consumes the `Socks5Stream`, returning the inner `TcpStream`.
-    pub fn into_inner(self) -> TcpStream {
+    /// Consumes the `Socks5Stream`, returning the inner `TcpOrUnixStream`.
+    pub fn into_inner(self) -> TcpOrUnixStream {
         self.socket
     }
 }
@@ -292,7 +307,7 @@ impl Socks5Listener {
         where T: ToSocketAddrs,
               U: ToTargetAddr
     {
-        Socks5Stream::connect_raw(2, proxy, target, &Authentication::None).map(Socks5Listener)
+        Socks5Stream::connect_raw(2, TcpOrUnixStream::connect_tsa(proxy)?, target, &Authentication::None).map(Socks5Listener)
     }
     /// Initiates a BIND request to the specified proxy using given username
     /// and password.
@@ -304,7 +319,25 @@ impl Socks5Listener {
               U: ToTargetAddr
     {
         let auth = Authentication::Password { username, password };
-        Socks5Stream::connect_raw(2, proxy, target, &auth).map(Socks5Listener)
+        Socks5Stream::connect_raw(2, TcpOrUnixStream::connect_tsa(proxy)?, target, &auth).map(Socks5Listener)
+    }
+
+    /// Connects to a target server through a SOCKS5 proxy.
+    pub fn bind_either<T, U>(proxy: T, target: U) -> io::Result<Socks5Listener>
+        where T: Into<SocketAddrOrUnixSocketAddr>,
+              U: ToTargetAddr
+    {
+        Socks5Stream::connect_raw(2, TcpOrUnixStream::connect(proxy)?, target, &Authentication::None).map(Socks5Listener)
+    }
+
+    /// Connects to a target server through a SOCKS5 proxy using given
+    /// username and password.
+    pub fn bind_either_with_password<T, U>(proxy: T, target: U, username: &str, password: &str) -> io::Result<Socks5Listener>
+        where T: Into<SocketAddrOrUnixSocketAddr>,
+              U: ToTargetAddr
+    {
+        let auth = Authentication::Password { username, password };
+        Socks5Stream::connect_raw(2, TcpOrUnixStream::connect(proxy)?, target, &auth).map(Socks5Listener)
     }
 
     /// The address of the proxy-side TCP listener.
@@ -360,7 +393,7 @@ impl Socks5Datagram {
         // we don't know what our IP is from the perspective of the proxy, so
         // don't try to pass `addr` in here.
         let dst = TargetAddr::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)));
-        let stream = Socks5Stream::connect_raw(3, proxy, dst, auth)?;
+        let stream = Socks5Stream::connect_raw(3, TcpOrUnixStream::connect_tsa(proxy)?, dst, auth)?;
 
         let socket = UdpSocket::bind(addr)?;
         socket.connect(&stream.proxy_addr)?;
